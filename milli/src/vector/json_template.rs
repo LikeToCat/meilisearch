@@ -77,6 +77,8 @@ pub struct ExtractedValues {
 }
 
 impl ExtractedValues {
+    /// Iterator over all extracted values regardless of their origin
+    #[allow(clippy::should_implement_trait)] // TODO: implement IntoIterator when we have some form of TAIT
     pub fn into_iter(self) -> impl Iterator<Item = Value> {
         self.static_value
             .into_iter()
@@ -498,7 +500,7 @@ fn format_value(value: &Value) -> String {
 }
 
 fn extract_value(
-    extraction_path: &Vec<PathComponent>,
+    extraction_path: &[PathComponent],
     initial_value: &mut Value,
 ) -> Result<Value, ExtractionErrorKind> {
     let mut current_value = initial_value;
@@ -510,7 +512,7 @@ fn extract_value(
                         return Err(ExtractionErrorKind::WrongPathComponent {
                             wrong_component: format_value(current_value),
                             index: path_index,
-                            path: extraction_path.clone(),
+                            path: extraction_path.to_vec(),
                         });
                     }
                     match current_value.get_mut(key) {
@@ -518,7 +520,7 @@ fn extract_value(
                         None => {
                             return Err(ExtractionErrorKind::MissingPathComponent {
                                 missing_index: path_index,
-                                path: extraction_path.clone(),
+                                path: extraction_path.to_vec(),
                             });
                         }
                     }
@@ -534,7 +536,7 @@ fn extract_value(
                                 current_value => current_value.to_string(),
                             },
                             index: path_index,
-                            path: extraction_path.clone(),
+                            path: extraction_path.to_vec(),
                         });
                     }
                     match current_value.get_mut(index) {
@@ -542,7 +544,7 @@ fn extract_value(
                         None => {
                             return Err(ExtractionErrorKind::MissingPathComponent {
                                 missing_index: path_index,
-                                path: extraction_path.clone(),
+                                path: extraction_path.to_vec(),
                             });
                         }
                     }
@@ -592,8 +594,8 @@ mod test {
 
         let empty = new_template(template.clone()).unwrap();
 
-        assert_eq!(empty.has_static_value(), false);
-        assert_eq!(empty.has_array_value(), false);
+        assert!(!empty.has_static_value());
+        assert!(!empty.has_array_value());
 
         assert_eq!(empty.inject(vec![]).unwrap(), template);
         assert_eq!(empty.inject(vec!["test".into()]).unwrap(), template);
@@ -609,8 +611,8 @@ mod test {
 
         let basic = new_template(template.clone()).unwrap();
 
-        assert_eq!(basic.has_static_value(), true);
-        assert_eq!(basic.has_array_value(), false);
+        assert!(basic.has_static_value());
+        assert!(!basic.has_array_value());
 
         assert_eq!(
             basic.inject(vec!["work".into(), Value::Null, "test".into()]).unwrap(),
@@ -658,8 +660,8 @@ mod test {
 
         let basic = new_template(template.clone()).unwrap();
 
-        assert_eq!(basic.has_static_value(), false);
-        assert_eq!(basic.has_array_value(), true);
+        assert!(!basic.has_static_value());
+        assert!(basic.has_array_value());
 
         let injected_values = vec![
             "work".into(),
