@@ -80,7 +80,7 @@ pub enum EmbedErrorKind {
     #[error("was expected '{}' to be an object in query '{0}'", .1.join("."))]
     RestNotAnObject(serde_json::Value, Vec<String>),
     #[error("while embedding tokenized, was expecting embeddings of dimension `{0}`, got embeddings of dimensions `{1}`")]
-    OpenAiUnexpectedDimension(usize, usize),
+    UnexpectedDimension(usize, usize),
     #[error("no embedding was produced")]
     MissingEmbedding,
     #[error(transparent)]
@@ -191,9 +191,9 @@ impl EmbedError {
         Self { kind: EmbedErrorKind::RestNotAnObject(query, input_path), fault: FaultSource::User }
     }
 
-    pub(crate) fn openai_unexpected_dimension(expected: usize, got: usize) -> EmbedError {
+    pub(crate) fn rest_unexpected_dimension(expected: usize, got: usize) -> EmbedError {
         Self {
-            kind: EmbedErrorKind::OpenAiUnexpectedDimension(expected, got),
+            kind: EmbedErrorKind::UnexpectedDimension(expected, got),
             fault: FaultSource::Runtime,
         }
     }

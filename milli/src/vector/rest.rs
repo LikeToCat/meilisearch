@@ -132,18 +132,18 @@ impl Embedder {
     }
 
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Embeddings<f32>>, EmbedError> {
-        embed(&self.data, texts.as_slice(), texts.len())
+        embed(&self.data, texts.as_slice(), texts.len(), Some(self.dimensions))
     }
 
     pub fn embed_ref<S>(&self, texts: &[S]) -> Result<Vec<Embeddings<f32>>, EmbedError>
     where
         S: AsRef<str> + Serialize,
     {
-        embed(&self.data, texts, texts.len())
+        embed(&self.data, texts, texts.len(), Some(self.dimensions))
     }
 
     pub fn embed_tokens(&self, tokens: &[usize]) -> Result<Embeddings<f32>, EmbedError> {
-        let mut embeddings = embed(&self.data, tokens, 1)?;
+        let mut embeddings = embed(&self.data, tokens, 1, Some(self.dimensions))?;
         // unwrap: guaranteed that embeddings.len() == 1, otherwise the previous line terminated in error
         Ok(embeddings.pop().unwrap())
     }
@@ -184,7 +184,7 @@ impl Embedder {
 }
 
 fn infer_dimensions(data: &EmbedderData) -> Result<usize, NewEmbedderError> {
-    let v = embed(data, ["test"].as_slice(), 1)
+    let v = embed(data, ["test"].as_slice(), 1, None)
         .map_err(NewEmbedderError::could_not_determine_dimension)?;
     // unwrap: guaranteed that v.len() == 1, otherwise the previous line terminated in error
     Ok(v.first().unwrap().dimension())
@@ -194,6 +194,7 @@ fn embed<S>(
     data: &EmbedderData,
     inputs: &[S],
     expected_count: usize,
+    expected_dimension: Option<usize>,
 ) -> Result<Vec<Embeddings<f32>>, EmbedError>
 where
     S: Serialize,
@@ -213,7 +214,9 @@ where
         let result = check_response(response);
 
         let retry_duration = match result {
-            Ok(response) => return response_to_embedding(response, data, expected_count),
+            Ok(response) => {
+                return response_to_embedding(response, data, expected_count, expected_dimension)
+            }
             Err(retry) => {
                 tracing::warn!("Failed: {}", retry.error);
                 retry.into_duration(attempt)
@@ -232,9 +235,9 @@ where
 
     let response = request.send_json(&body);
     let result = check_response(response);
-    result
-        .map_err(Retry::into_error)
-        .and_then(|response| response_to_embedding(response, data, expected_count))
+    result.map_err(Retry::into_error).and_then(|response| {
+        response_to_embedding(response, data, expected_count, expected_dimension)
+    })
 }
 
 fn check_response(response: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, Retry> {
@@ -265,6 +268,7 @@ fn response_to_embedding(
     response: ureq::Response,
     data: &EmbedderData,
     expected_count: usize,
+    expected_dimensions: Option<usize>,
 ) -> Result<Vec<Embeddings<f32>>, EmbedError> {
     let response: serde_json::Value =
         response.into_json().map_err(EmbedError::rest_response_deserialization)?;
@@ -273,6 +277,17 @@ fn response_to_embedding(
 
     if embeddings.len() != expected_count {
         return Err(EmbedError::rest_response_embedding_count(expected_count, embeddings.len()));
+    }
+
+    if let Some(dimensions) = expected_dimensions {
+        for embedding in &embeddings {
+            if embedding.dimension() != dimensions {
+                return Err(EmbedError::rest_unexpected_dimension(
+                    dimensions,
+                    embedding.dimension(),
+                ));
+            }
+        }
     }
 
     Ok(embeddings)

@@ -225,7 +225,7 @@ impl Embedder {
 
             let embedding = self.rest_embedder.embed_tokens(tokens)?;
             embeddings_for_prompt.append(embedding.into_inner()).map_err(|got| {
-                EmbedError::openai_unexpected_dimension(self.dimensions(), got.len())
+                EmbedError::rest_unexpected_dimension(self.dimensions(), got.len())
             })?;
 
             all_embeddings.push(embeddings_for_prompt);
