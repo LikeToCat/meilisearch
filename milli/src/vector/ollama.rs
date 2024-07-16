@@ -33,13 +33,13 @@ impl Embedder {
             dimensions: None,
             distribution: options.distribution,
             url: options.url.unwrap_or_else(get_ollama_path),
-            query: serde_json::json!({
+            request: serde_json::json!({
                 "model": model,
+                "prompt": "{{text}}",
             }),
-            input_field: vec!["prompt".to_owned()],
-            path_to_embeddings: Default::default(),
-            embedding_object: vec!["embedding".to_owned()],
-            input_type: super::rest::InputType::Text,
+            response: serde_json::json!({
+                "embedding": "{{embedding}}",
+            }),
         }) {
             Ok(embedder) => embedder,
             Err(NewEmbedderError {

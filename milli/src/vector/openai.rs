@@ -26,11 +26,12 @@ impl EmbedderOptions {
         }
     }
 
-    pub fn query(&self) -> serde_json::Value {
+    pub fn request(&self) -> serde_json::Value {
         let model = self.embedding_model.name();
 
         let mut query = serde_json::json!({
             "model": model,
+            "input": ["{{text}}", "{{..}}"]
         });
 
         if self.embedding_model.supports_overriding_dimensions() {
@@ -185,11 +186,14 @@ impl Embedder {
             distribution: None,
             dimensions: Some(options.dimensions()),
             url,
-            query: options.query(),
-            input_field: vec!["input".to_owned()],
-            input_type: crate::vector::rest::InputType::TextArray,
-            path_to_embeddings: vec!["data".to_owned()],
-            embedding_object: vec!["embedding".to_owned()],
+            request: options.request(),
+            response: serde_json::json!({
+                "data": [{
+                    "embedding": "{{embedding}}"
+                },
+                "{{..}}"
+                ]
+            }),
         })?;
 
         // looking at the code it is very unclear that this can actually fail.
