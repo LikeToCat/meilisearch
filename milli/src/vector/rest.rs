@@ -4,6 +4,7 @@ use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use serde::{Deserialize, Serialize};
 
 use super::error::EmbedErrorKind;
+use super::json_template::ValueTemplate;
 use super::{
     DistributionShift, EmbedError, Embedding, Embeddings, NewEmbedderError, REQUEST_PARALLELISM,
 };
@@ -11,7 +12,6 @@ use crate::error::FaultSource;
 use crate::ThreadPoolNoAbort;
 
 // retrying in case of failure
-
 pub struct Retry {
     pub error: EmbedError,
     strategy: RetryStrategy,
@@ -63,10 +63,19 @@ impl Retry {
 
 #[derive(Debug)]
 pub struct Embedder {
-    client: ureq::Agent,
-    options: EmbedderOptions,
-    bearer: Option<String>,
+    data: EmbedderData,
     dimensions: usize,
+    distribution: Option<DistributionShift>,
+}
+
+/// All data needed to perform requests and parse responses
+#[derive(Debug)]
+struct EmbedderData {
+    client: ureq::Agent,
+    bearer: Option<String>,
+    url: String,
+    request: Request,
+    response: Response,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -75,29 +84,8 @@ pub struct EmbedderOptions {
     pub distribution: Option<DistributionShift>,
     pub dimensions: Option<usize>,
     pub url: String,
-    pub query: serde_json::Value,
-    pub input_field: Vec<String>,
-    // path to the array of embeddings
-    pub path_to_embeddings: Vec<String>,
-    // shape of a single embedding
-    pub embedding_object: Vec<String>,
-    pub input_type: InputType,
-}
-
-impl Default for EmbedderOptions {
-    fn default() -> Self {
-        Self {
-            url: Default::default(),
-            query: Default::default(),
-            input_field: vec!["input".into()],
-            path_to_embeddings: vec!["data".into()],
-            embedding_object: vec!["embedding".into()],
-            input_type: InputType::Text,
-            api_key: None,
-            distribution: None,
-            dimensions: None,
-        }
-    }
+    pub request: serde_json::Value,
+    pub response: serde_json::Value,
 }
 
 impl std::hash::Hash for EmbedderOptions {
@@ -106,13 +94,9 @@ impl std::hash::Hash for EmbedderOptions {
         self.distribution.hash(state);
         self.dimensions.hash(state);
         self.url.hash(state);
-        // skip hashing the query
+        // skip hashing the request and response
         // collisions in regular usage should be minimal,
         // and the list is limited to 256 values anyway
-        self.input_field.hash(state);
-        self.path_to_embeddings.hash(state);
-        self.embedding_object.hash(state);
-        self.input_type.hash(state);
     }
 }
 
@@ -133,28 +117,33 @@ impl Embedder {
             .max_idle_connections_per_host(REQUEST_PARALLELISM * 2)
             .build();
 
+        let request = Request::new(options.request)?;
+        let response = Response::new(options.response, request.input_type())?;
+
+        let data = EmbedderData { client, bearer, url: options.url, request, response };
+
         let dimensions = if let Some(dimensions) = options.dimensions {
             dimensions
         } else {
-            infer_dimensions(&client, &options, bearer.as_deref())?
+            infer_dimensions(&data)?
         };
 
-        Ok(Self { client, dimensions, options, bearer })
+        Ok(Self { data, dimensions, distribution: options.distribution })
     }
 
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Embeddings<f32>>, EmbedError> {
-        embed(&self.client, &self.options, self.bearer.as_deref(), texts.as_slice(), texts.len())
+        embed(&self.data, texts.as_slice(), texts.len())
     }
 
     pub fn embed_ref<S>(&self, texts: &[S]) -> Result<Vec<Embeddings<f32>>, EmbedError>
     where
         S: AsRef<str> + Serialize,
     {
-        embed(&self.client, &self.options, self.bearer.as_deref(), texts, texts.len())
+        embed(&self.data, texts, texts.len())
     }
 
     pub fn embed_tokens(&self, tokens: &[usize]) -> Result<Embeddings<f32>, EmbedError> {
-        let mut embeddings = embed(&self.client, &self.options, self.bearer.as_deref(), tokens, 1)?;
+        let mut embeddings = embed(&self.data, tokens, 1)?;
         // unwrap: guaranteed that embeddings.len() == 1, otherwise the previous line terminated in error
         Ok(embeddings.pop().unwrap())
     }
@@ -179,7 +168,7 @@ impl Embedder {
     }
 
     pub fn prompt_count_in_chunk_hint(&self) -> usize {
-        match self.options.input_type {
+        match self.data.request.input_type() {
             InputType::Text => 1,
             InputType::TextArray => 10,
         }
@@ -190,87 +179,41 @@ impl Embedder {
     }
 
     pub fn distribution(&self) -> Option<DistributionShift> {
-        self.options.distribution
+        self.distribution
     }
 }
 
-fn infer_dimensions(
-    client: &ureq::Agent,
-    options: &EmbedderOptions,
-    bearer: Option<&str>,
-) -> Result<usize, NewEmbedderError> {
-    let v = embed(client, options, bearer, ["test"].as_slice(), 1)
+fn infer_dimensions(data: &EmbedderData) -> Result<usize, NewEmbedderError> {
+    let v = embed(data, ["test"].as_slice(), 1)
         .map_err(NewEmbedderError::could_not_determine_dimension)?;
     // unwrap: guaranteed that v.len() == 1, otherwise the previous line terminated in error
     Ok(v.first().unwrap().dimension())
 }
 
 fn embed<S>(
-    client: &ureq::Agent,
-    options: &EmbedderOptions,
-    bearer: Option<&str>,
+    data: &EmbedderData,
     inputs: &[S],
     expected_count: usize,
 ) -> Result<Vec<Embeddings<f32>>, EmbedError>
 where
     S: Serialize,
 {
-    let request = client.post(&options.url);
-    let request =
-        if let Some(bearer) = bearer { request.set("Authorization", bearer) } else { request };
+    let request = data.client.post(&data.url);
+    let request = if let Some(bearer) = &data.bearer {
+        request.set("Authorization", bearer)
+    } else {
+        request
+    };
     let request = request.set("Content-Type", "application/json");
 
-    let input_value = match options.input_type {
-        InputType::Text => serde_json::json!(inputs.first()),
-        InputType::TextArray => serde_json::json!(inputs),
-    };
-
-    let body = match options.input_field.as_slice() {
-        [] => {
-            // inject input in body
-            input_value
-        }
-        [input] => {
-            let mut body = options.query.clone();
-
-            body.as_object_mut()
-                .ok_or_else(|| {
-                    EmbedError::rest_not_an_object(
-                        options.query.clone(),
-                        options.input_field.clone(),
-                    )
-                })?
-                .insert(input.clone(), input_value);
-            body
-        }
-        [path @ .., input] => {
-            let mut body = options.query.clone();
-
-            let mut current_value = &mut body;
-            for component in path {
-                current_value = current_value
-                    .as_object_mut()
-                    .ok_or_else(|| {
-                        EmbedError::rest_not_an_object(
-                            options.query.clone(),
-                            options.input_field.clone(),
-                        )
-                    })?
-                    .entry(component.clone())
-                    .or_insert(serde_json::json!({}));
-            }
-
-            current_value.as_object_mut().unwrap().insert(input.clone(), input_value);
-            body
-        }
-    };
+    let body = data.request.inject_texts(inputs);
 
     for attempt in 0..10 {
         let response = request.clone().send_json(&body);
         let result = check_response(response);
 
         let retry_duration = match result {
-            Ok(response) => return response_to_embedding(response, options, expected_count),
+            Ok(response) => return response_to_embedding(response, data, expected_count),
             Err(retry) => {
                 tracing::warn!("Failed: {}", retry.error);
                 retry.into_duration(attempt)
@@ -291,7 +234,7 @@ where
     let result = check_response(response);
     result
         .map_err(Retry::into_error)
-        .and_then(|response| response_to_embedding(response, options, expected_count))
+        .and_then(|response| response_to_embedding(response, data, expected_count))
 }
 
 fn check_response(response: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, Retry> {
@@ -320,68 +263,93 @@ fn check_response(response: Result<ureq::Response, ureq::Error>) -> Result<ureq:
 
 fn response_to_embedding(
     response: ureq::Response,
-    options: &EmbedderOptions,
+    data: &EmbedderData,
     expected_count: usize,
 ) -> Result<Vec<Embeddings<f32>>, EmbedError> {
     let response: serde_json::Value =
         response.into_json().map_err(EmbedError::rest_response_deserialization)?;
 
-    let mut current_value = &response;
-    for component in &options.path_to_embeddings {
-        let component = component.as_ref();
-        current_value = current_value.get(component).ok_or_else(|| {
-            EmbedError::rest_response_missing_embeddings(
-                response.clone(),
-                component,
-                &options.path_to_embeddings,
-            )
-        })?;
-    }
-
-    let embeddings = match options.input_type {
-        InputType::Text => {
-            for component in &options.embedding_object {
-                current_value = current_value.get(component).ok_or_else(|| {
-                    EmbedError::rest_response_missing_embeddings(
-                        response.clone(),
-                        component,
-                        &options.embedding_object,
-                    )
-                })?;
-            }
-            let embeddings = current_value.to_owned();
-            let embeddings: Embedding =
-                serde_json::from_value(embeddings).map_err(EmbedError::rest_response_format)?;
-
-            vec![Embeddings::from_single_embedding(embeddings)]
-        }
-        InputType::TextArray => {
-            let empty = vec![];
-            let values = current_value.as_array().unwrap_or(&empty);
-            let mut embeddings: Vec<Embeddings<f32>> = Vec::with_capacity(expected_count);
-            for value in values {
-                let mut current_value = value;
-                for component in &options.embedding_object {
-                    current_value = current_value.get(component).ok_or_else(|| {
-                        EmbedError::rest_response_missing_embeddings(
-                            response.clone(),
-                            component,
-                            &options.embedding_object,
-                        )
-                    })?;
-                }
-                let embedding = current_value.to_owned();
-                let embedding: Embedding =
-                    serde_json::from_value(embedding).map_err(EmbedError::rest_response_format)?;
-                embeddings.push(Embeddings::from_single_embedding(embedding));
-            }
-            embeddings
-        }
-    };
+    let embeddings = data.response.extract_embeddings(response)?;
 
     if embeddings.len() != expected_count {
         return Err(EmbedError::rest_response_embedding_count(expected_count, embeddings.len()));
     }
 
     Ok(embeddings)
+}
+
+#[derive(Debug)]
+pub struct Request {
+    template: ValueTemplate,
+    input_type: InputType,
+}
+
+impl Request {
+    pub fn new(template: serde_json::Value) -> Result<Self, NewEmbedderError> {
+        /// TODO: error handling
+        let template = ValueTemplate::new(template, "{{text}}".to_string(), "{{..}}".to_string())
+            .expect("handle various error cases");
+        let input_type = match (template.has_array_value(), template.has_static_value()) {
+            (true, true) => todo!("error: cannot have both"),
+            (true, false) => InputType::TextArray,
+            (false, true) => InputType::Text,
+            (false, false) => todo!("error: must have one"),
+        };
+        Ok(Self { template, input_type })
+    }
+
+    pub fn input_type(&self) -> InputType {
+        self.input_type
+    }
+
+    pub fn inject_texts<S: Serialize>(
+        &self,
+        texts: impl IntoIterator<Item = S>,
+    ) -> serde_json::Value {
+        self.template.inject(texts.into_iter().map(|s| serde_json::json!(s))).unwrap()
+    }
+}
+
+#[derive(Debug)]
+pub struct Response {
+    template: ValueTemplate,
+}
+
+impl Response {
+    pub fn new(
+        template: serde_json::Value,
+        input_type: InputType,
+    ) -> Result<Self, NewEmbedderError> {
+        /// TODO: error handling
+        let template =
+            ValueTemplate::new(template, "{{embedding}}".to_string(), "{{..}}".to_string())
+                .expect("handle various error cases");
+        match (template.has_array_value(), template.has_static_value(), input_type) {
+            (true, true, _) => todo!("error: cannot have both"),
+            (false, false, _) => todo!("error: must have one"),
+            (true, false, InputType::Text) => todo!("error: array but request is single text"),
+            (true, false, InputType::TextArray) => {}
+            (false, true, InputType::Text) => {}
+            (false, true, InputType::TextArray) => {
+                todo!("error: single text, but request is array")
+            }
+        }
+        Ok(Self { template })
+    }
+
+    pub fn extract_embeddings(
+        &self,
+        response: serde_json::Value,
+    ) -> Result<Vec<Embeddings<f32>>, EmbedError> {
+        /// TODO: error handling
+        let extracted_values = self.template.extract(response).expect("handle various error cases");
+        let mut embeddings: Vec<Embeddings<f32>> = Vec::new();
+        for value in extracted_values.into_iter() {
+            /// TODO: improve error handling
+            let embedding: Embedding =
+                serde_json::from_value(value).map_err(EmbedError::rest_response_format)?;
+            embeddings.push(Embeddings::from_single_embedding(embedding));
+        }
+        Ok(embeddings)
+    }
 }
