@@ -1548,7 +1548,7 @@ pub fn validate_embedding_settings(
         let request = crate::vector::rest::Request::new(request.to_owned())
             .map_err(|error| crate::UserError::VectorEmbeddingError(error.into()))?;
         if let Some(response) = response.as_ref().set() {
-            crate::vector::rest::Response::new(response.to_owned(), request.input_type())
+            crate::vector::rest::Response::new(response.to_owned(), &request)
                 .map_err(|error| crate::UserError::VectorEmbeddingError(error.into()))?;
         }
     }

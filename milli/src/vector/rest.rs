@@ -103,7 +103,7 @@ impl std::hash::Hash for EmbedderOptions {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash, Deserr)]
 #[serde(rename_all = "camelCase")]
 #[deserr(rename_all = camelCase, deny_unknown_fields)]
-pub enum InputType {
+enum InputType {
     Text,
     TextArray,
 }
@@ -118,7 +118,7 @@ impl Embedder {
             .build();
 
         let request = Request::new(options.request)?;
-        let response = Response::new(options.response, request.input_type())?;
+        let response = Response::new(options.response, &request)?;
 
         let data = EmbedderData { client, bearer, url: options.url, request, response };
 
@@ -296,25 +296,28 @@ fn response_to_embedding(
 #[derive(Debug)]
 pub struct Request {
     template: ValueTemplate,
-    input_type: InputType,
 }
 
 impl Request {
     pub fn new(template: serde_json::Value) -> Result<Self, NewEmbedderError> {
-        /// TODO: error handling
-        let template = ValueTemplate::new(template, "{{text}}".to_string(), "{{..}}".to_string())
-            .expect("handle various error cases");
-        let input_type = match (template.has_array_value(), template.has_static_value()) {
-            (true, true) => todo!("error: cannot have both"),
-            (true, false) => InputType::TextArray,
-            (false, true) => InputType::Text,
-            (false, false) => todo!("error: must have one"),
-        };
-        Ok(Self { template, input_type })
+        let template =
+            match ValueTemplate::new(template, "{{text}}".to_string(), "{{..}}".to_string()) {
+                Ok(template) => template,
+                Err(error) => {
+                    let message = error.error_message("request", "{{text}}", "{{..}}");
+                    return Err(NewEmbedderError::rest_could_not_parse_template(message));
+                }
+            };
+
+        Ok(Self { template })
     }
 
-    pub fn input_type(&self) -> InputType {
-        self.input_type
+    fn input_type(&self) -> InputType {
+        if self.template.has_array_value() {
+            InputType::TextArray
+        } else {
+            InputType::Text
+        }
     }
 
     pub fn inject_texts<S: Serialize>(
@@ -331,40 +334,38 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn new(
-        template: serde_json::Value,
-        input_type: InputType,
-    ) -> Result<Self, NewEmbedderError> {
-        /// TODO: error handling
+    pub fn new(template: serde_json::Value, request: &Request) -> Result<Self, NewEmbedderError> {
         let template =
-            ValueTemplate::new(template, "{{embedding}}".to_string(), "{{..}}".to_string())
-                .expect("handle various error cases");
-        match (template.has_array_value(), template.has_static_value(), input_type) {
-            (true, true, _) => todo!("error: cannot have both"),
-            (false, false, _) => todo!("error: must have one"),
-            (true, false, InputType::Text) => todo!("error: array but request is single text"),
-            (true, false, InputType::TextArray) => {}
-            (false, true, InputType::Text) => {}
-            (false, true, InputType::TextArray) => {
-                todo!("error: single text, but request is array")
-            }
+            match ValueTemplate::new(template, "{{embedding}}".to_string(), "{{..}}".to_string()) {
+                Ok(template) => template,
+                Err(error) => {
+                    let message = error.error_message("response", "{{embedding}}", "{{..}}");
+                    return Err(NewEmbedderError::rest_could_not_parse_template(message));
+                }
+            };
+
+        match (template.has_array_value(), request.template.has_array_value()) {
+            (true, true) | (false, false) => Ok(Self {template}),
+            (true, false) => Err(NewEmbedderError::rest_could_not_parse_template("in `response`: `response` has multiple embeddings, but `request` only has one text to embed".to_string())),
+            (false, true) => Err(NewEmbedderError::rest_could_not_parse_template("in `response`: `response` has a single embedding, but `request` has multiple texts to embed".to_string())),
         }
-        Ok(Self { template })
     }
 
     pub fn extract_embeddings(
         &self,
         response: serde_json::Value,
     ) -> Result<Vec<Embeddings<f32>>, EmbedError> {
-        /// TODO: error handling
-        let extracted_values = self.template.extract(response).expect("handle various error cases");
-        let mut embeddings: Vec<Embeddings<f32>> = Vec::new();
-        for value in extracted_values.into_iter() {
-            /// TODO: improve error handling
-            let embedding: Embedding =
-                serde_json::from_value(value).map_err(EmbedError::rest_response_format)?;
-            embeddings.push(Embeddings::from_single_embedding(embedding));
-        }
+        let extracted_values: Vec<Embedding> = match self.template.extract(response) {
+            Ok(extracted_values) => extracted_values,
+            Err(error) => {
+                let error_message =
+                    error.error_message("response", "{{embedding}}", "an array of numbers");
+                return Err(EmbedError::rest_extraction_error(error_message));
+            }
+        };
+        let embeddings: Vec<Embeddings<f32>> =
+            extracted_values.into_iter().map(Embeddings::from_single_embedding).collect();
+
         Ok(embeddings)
     }
 }
