@@ -59,10 +59,6 @@ pub enum EmbedErrorKind {
     OllamaModelNotFoundError(Option<String>),
     #[error("error deserialization the response body as JSON: {0}")]
     RestResponseDeserialization(std::io::Error),
-    #[error("component `{0}` not found in path `{1}` in response: `{2}`")]
-    RestResponseMissingEmbeddings(String, String, String),
-    #[error("unexpected format of the embedding response: {0}")]
-    RestResponseFormat(serde_json::Error),
     #[error("expected a response containing {0} embeddings, got only {1}")]
     RestResponseEmbeddingCount(usize, usize),
     #[error("could not authenticate against embedding server: {0:?}")]
@@ -77,8 +73,8 @@ pub enum EmbedErrorKind {
     RestOtherStatusCode(u16, Option<String>),
     #[error("could not reach embedding server: {0}")]
     RestNetwork(ureq::Transport),
-    #[error("was expected '{}' to be an object in query '{0}'", .1.join("."))]
-    RestNotAnObject(serde_json::Value, Vec<String>),
+    #[error("error extracting embeddings from the response: {0}")]
+    RestExtractionError(String),
     #[error("while embedding tokenized, was expecting embeddings of dimension `{0}`, got embeddings of dimensions `{1}`")]
     UnexpectedDimension(usize, usize),
     #[error("no embedding was produced")]
@@ -117,28 +113,6 @@ impl EmbedError {
             kind: EmbedErrorKind::RestResponseDeserialization(error),
             fault: FaultSource::Runtime,
         }
-    }
-
-    pub(crate) fn rest_response_missing_embeddings<S: AsRef<str>>(
-        response: serde_json::Value,
-        component: &str,
-        response_field: &[S],
-    ) -> EmbedError {
-        let response_field: Vec<&str> = response_field.iter().map(AsRef::as_ref).collect();
-        let response_field = response_field.join(".");
-
-        Self {
-            kind: EmbedErrorKind::RestResponseMissingEmbeddings(
-                component.to_owned(),
-                response_field,
-                serde_json::to_string_pretty(&response).unwrap_or_default(),
-            ),
-            fault: FaultSource::Undecided,
-        }
-    }
-
-    pub(crate) fn rest_response_format(error: serde_json::Error) -> EmbedError {
-        Self { kind: EmbedErrorKind::RestResponseFormat(error), fault: FaultSource::Undecided }
     }
 
     pub(crate) fn rest_response_embedding_count(expected: usize, got: usize) -> EmbedError {
@@ -184,13 +158,6 @@ impl EmbedError {
         Self { kind: EmbedErrorKind::RestNetwork(transport), fault: FaultSource::Runtime }
     }
 
-    pub(crate) fn rest_not_an_object(
-        query: serde_json::Value,
-        input_path: Vec<String>,
-    ) -> EmbedError {
-        Self { kind: EmbedErrorKind::RestNotAnObject(query, input_path), fault: FaultSource::User }
-    }
-
     pub(crate) fn rest_unexpected_dimension(expected: usize, got: usize) -> EmbedError {
         Self {
             kind: EmbedErrorKind::UnexpectedDimension(expected, got),
@@ -199,6 +166,10 @@ impl EmbedError {
     }
     pub(crate) fn missing_embedding() -> EmbedError {
         Self { kind: EmbedErrorKind::MissingEmbedding, fault: FaultSource::Undecided }
+    }
+
+    pub(crate) fn rest_extraction_error(error: String) -> EmbedError {
+        Self { kind: EmbedErrorKind::RestExtractionError(error), fault: FaultSource::Runtime }
     }
 }
 
@@ -265,6 +236,13 @@ impl NewEmbedderError {
             fault: FaultSource::Runtime,
         }
     }
+
+    pub(crate) fn rest_could_not_parse_template(message: String) -> NewEmbedderError {
+        Self {
+            kind: NewEmbedderErrorKind::CouldNotParseTemplate(message),
+            fault: FaultSource::User,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -311,6 +289,8 @@ pub enum NewEmbedderErrorKind {
     CouldNotDetermineDimension(EmbedError),
     #[error("loading model failed: {0}")]
     LoadModel(candle_core::Error),
+    #[error("{0}")]
+    CouldNotParseTemplate(String),
 }
 
 pub struct PossibleEmbeddingMistakes {
