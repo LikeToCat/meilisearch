@@ -7,6 +7,7 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 #![warn(missing_docs)]
 
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 type ValuePath = Vec<PathComponent>;
@@ -15,8 +16,13 @@ type ValuePath = Vec<PathComponent>;
 #[derive(Debug)]
 pub struct ValueTemplate {
     template: Value,
-    value_path: Option<ValuePath>,
-    array_path: Option<ArrayPath>,
+    value_kind: ValueKind,
+}
+
+#[derive(Debug)]
+enum ValueKind {
+    Single(ValuePath),
+    Array(ArrayPath),
 }
 
 #[derive(Debug)]
@@ -64,27 +70,9 @@ impl Ord for PathComponent {
     }
 }
 
-/// Error that occurs when too few values were provided to a template for injection.
+/// Error that occurs when no few value was provided to a template for injection.
 #[derive(Debug)]
-pub struct MissingStaticValue;
-
-/// Result of extracting subvalues from a value and a template.
-pub struct ExtractedValues {
-    /// Value extracted from the static location
-    pub static_value: Option<Value>,
-    /// Values extracted from the array
-    pub array_values: Option<Vec<Value>>,
-}
-
-impl ExtractedValues {
-    /// Iterator over all extracted values regardless of their origin
-    #[allow(clippy::should_implement_trait)] // TODO: implement IntoIterator when we have some form of TAIT
-    pub fn into_iter(self) -> impl Iterator<Item = Value> {
-        self.static_value
-            .into_iter()
-            .chain(self.array_values.into_iter().flat_map(|array| array.into_iter()))
-    }
-}
+pub struct MissingValue;
 
 /// Error that occurs when trying to parse a template in [`ValueTemplate::new`]
 #[derive(Debug)]
@@ -97,12 +85,75 @@ pub enum TemplateParsingError {
     BadIndexForRepeatString(ValuePath, usize),
     /// A repeated value lacks a placeholder
     MissingPlaceholderInRepeatedValue(ValuePath),
-    /// A repeated value contains multiple placeholders
-    MultiplePlaceholdersInRepeatedValue(ValuePath, Vec<ValuePath>),
     /// Multiple repeat string appear in the template
     MultipleRepeatString(ValuePath, ValuePath),
     /// Multiple placeholder strings appear in the template
     MultiplePlaceholderString(ValuePath, ValuePath),
+    /// No placeholder string appear in the template
+    MissingPlaceholderString,
+    /// A placeholder appears both inside a repeated value and outside of it
+    BothArrayAndSingle {
+        /// Path to the single value
+        single_path: ValuePath,
+        /// Path to the array of repeated values
+        path_to_array: ValuePath,
+        /// Path to placeholder inside each repeated value, starting from the array
+        array_to_placeholder: ValuePath,
+    },
+}
+
+impl TemplateParsingError {
+    /// Produce an error message from the error kind, the name of the root object, the placeholder string and the repeat string
+    pub fn error_message(&self, root: &str, placeholder: &str, repeat: &str) -> String {
+        match self {
+            TemplateParsingError::NestedRepeatString(path) => {
+                format!(
+                    r#"""in {}: "{repeat}" appears nested inside of a value that is itself repeated"""#,
+                    path_with_root(root, path)
+                )
+            }
+            TemplateParsingError::RepeatStringNotInArray(path) => format!(
+                r#"""in {}: "{repeat}" appears outside of an array"""#,
+                path_with_root(root, path)
+            ),
+            TemplateParsingError::BadIndexForRepeatString(path, index) => format!(
+                r#"""in {}: "{repeat}" expected at position #1, but found at position #{index}"""#,
+                path_with_root(root, path)
+            ),
+            TemplateParsingError::MissingPlaceholderInRepeatedValue(path) => format!(
+                r#"""in {}: Expected "{placeholder}" inside of the repeated value"""#,
+                path_with_root(root, path)
+            ),
+            TemplateParsingError::MultipleRepeatString(current, previous) => format!(
+                r#"""in {}: Found "{repeat}", but it was already present in {}"""#,
+                path_with_root(root, current),
+                path_with_root(root, previous)
+            ),
+            TemplateParsingError::MultiplePlaceholderString(current, previous) => format!(
+                r#"""in {}: Found "{placeholder}", but it was already present in {}"""#,
+                path_with_root(root, current),
+                path_with_root(root, previous)
+            ),
+            TemplateParsingError::MissingPlaceholderString => {
+                format!(r#"in `{root}`: "{placeholder}" not found"#)
+            }
+            TemplateParsingError::BothArrayAndSingle {
+                single_path,
+                path_to_array,
+                array_to_placeholder,
+            } => {
+                let path_to_first_repeated = path_to_array
+                    .iter()
+                    .chain(std::iter::once(&PathComponent::ArrayIndex(0)))
+                    .chain(array_to_placeholder.iter());
+                format!(
+                    r#"in {}: Found "{placeholder}", but it was already present in {} (repeated)"#,
+                    path_with_root(root, single_path),
+                    path_with_root(root, path_to_first_repeated)
+                )
+            }
+        }
+    }
 }
 
 /// Error that occurs when [`ValueTemplate::extract`] fails.
@@ -120,17 +171,169 @@ pub struct ExtractionError {
     pub value: Value,
 }
 
+impl ExtractionError {
+    /// Produce an error message from the error, the name of the root object, the placeholder string and the expected value type
+    pub fn error_message(
+        &self,
+        root: &str,
+        placeholder: &str,
+        expected_value_type: &str,
+    ) -> String {
+        let context = match &self.context {
+            ExtractionErrorContext::ExtractingSingleValue => {
+                format!(r#"extracting a single "{placeholder}""#)
+            }
+            ExtractionErrorContext::FindingPathToArray => {
+                format!(r#"extracting the array of "{placeholder}"s"#)
+            }
+            ExtractionErrorContext::ExtractingArrayItem(index) => {
+                format!(r#"extracting item #{index} from the array of "{placeholder}"s"#)
+            }
+        };
+        match &self.kind {
+            ExtractionErrorKind::MissingPathComponent { missing_index, path } => {
+                let last_named_object = last_named_object(root, path.iter().take(*missing_index));
+                format!(
+                    "in {}, while {context}, missing {}",
+                    path_with_root(root, path.iter().take(*missing_index)),
+                    missing_component(path.get(*missing_index), last_named_object)
+                )
+            }
+            ExtractionErrorKind::WrongPathComponent { wrong_component, index, path } => {
+                let last_named_object = last_named_object(root, path.iter().take(*index));
+                format!(
+                    "in {}, while {context}, expected {last_named_object} to be {} but it is {wrong_component}",
+                    path_with_root(root, path.iter().take(*index)),
+                    expected_component(path.get(*index))
+                )
+            }
+            ExtractionErrorKind::DeserializationError { error, path } => {
+                let last_named_object = last_named_object(root, path);
+                format!(
+                    "in {}, while {context}, expected {last_named_object} to be {expected_value_type}, but failed to parse it with {error}",
+                    path_with_root(root, path)
+                )
+            }
+        }
+    }
+}
+
+fn missing_component(
+    component: Option<&PathComponent>,
+    named_object: LastNamedObject<'_>,
+) -> String {
+    match component {
+        Some(PathComponent::ArrayIndex(index)) => {
+            format!(r#"item #{index} ({named_object} has less than {index} elements)"#)
+        }
+        Some(PathComponent::MapKey(key)) => {
+            format!(r#"key "{key} ({named_object} doesn't have this key)""#)
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+fn expected_component(component: Option<&PathComponent>) -> String {
+    match component {
+        Some(PathComponent::ArrayIndex(index)) => {
+            format!(r#"an array with at least {} items"#, index.saturating_add(1))
+        }
+        Some(PathComponent::MapKey(key)) => {
+            format!("an object with key `{}`", key)
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+fn last_named_object<'a>(
+    root: &'a str,
+    path: impl IntoIterator<Item = &'a PathComponent> + 'a,
+) -> LastNamedObject<'a> {
+    let mut last_named_object = LastNamedObject::Object { name: root };
+    for component in path.into_iter() {
+        last_named_object = match (component, last_named_object) {
+            (PathComponent::MapKey(name), _) => LastNamedObject::Object { name },
+            (PathComponent::ArrayIndex(index), LastNamedObject::Object { name }) => {
+                LastNamedObject::ArrayInsideObject { object_name: name, index: *index }
+            }
+            (
+                PathComponent::ArrayIndex(index),
+                LastNamedObject::ArrayInsideObject { object_name, index: _ },
+            ) => LastNamedObject::NestedArrayInsideObject {
+                object_name,
+                index: *index,
+                nesting_level: 0,
+            },
+            (
+                PathComponent::ArrayIndex(index),
+                LastNamedObject::NestedArrayInsideObject { object_name, index: _, nesting_level },
+            ) => LastNamedObject::NestedArrayInsideObject {
+                object_name,
+                index: *index,
+                nesting_level: nesting_level.saturating_add(1),
+            },
+        }
+    }
+    last_named_object
+}
+
+impl<'a> std::fmt::Display for LastNamedObject<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LastNamedObject::Object { name } => write!(f, "`{name}`"),
+            LastNamedObject::ArrayInsideObject { object_name, index } => {
+                write!(f, "item #{index} inside `{object_name}`")
+            }
+            LastNamedObject::NestedArrayInsideObject { object_name, index, nesting_level } => {
+                if *nesting_level == 0 {
+                    write!(f, "item #{index} inside nested array in `{object_name}`")
+                } else {
+                    write!(f, "item #{index} inside nested array ({} levels of nesting) in `{object_name}`", nesting_level + 1)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LastNamedObject<'a> {
+    Object { name: &'a str },
+    ArrayInsideObject { object_name: &'a str, index: usize },
+    NestedArrayInsideObject { object_name: &'a str, index: usize, nesting_level: usize },
+}
+
+/// Builds a string representation of a path, preprending the name of the root value.
+pub fn path_with_root<'a>(
+    root: &str,
+    path: impl IntoIterator<Item = &'a PathComponent> + 'a,
+) -> String {
+    use std::fmt::Write as _;
+    let mut res = format!("`{root}");
+    for component in path.into_iter() {
+        match component {
+            PathComponent::MapKey(key) => {
+                let _ = write!(&mut res, ".{key}");
+            }
+            PathComponent::ArrayIndex(index) => {
+                let _ = write!(&mut res, "[{index}]");
+            }
+        }
+    }
+    res.push('`');
+    res
+}
+
 /// Context where an extraction failure happened
 ///
 /// The operation that failed
 #[derive(Debug, Clone, Copy)]
 pub enum ExtractionErrorContext {
-    /// Failure happened while extracting a value at a static location
-    ExtractingStaticValue,
+    /// Failure happened while extracting a value at a single location
+    ExtractingSingleValue,
     /// Failure happened while extracting an array of values
     FindingPathToArray,
     /// Failure happened while extracting a value inside of an array
-    ExtractingArrayItem,
+    ExtractingArrayItem(usize),
 }
 
 /// Kind of errors that can happen during extraction
@@ -152,6 +355,13 @@ pub enum ExtractionErrorKind {
         /// Path where a component has the wrong type
         path: ValuePath,
     },
+    /// Could not deserialize an extracted value to its requested type
+    DeserializationError {
+        /// inner deserialization error
+        error: serde_json::Error,
+        /// path to extracted value
+        path: ValuePath,
+    },
 }
 
 impl ValueTemplate {
@@ -168,10 +378,7 @@ impl ValueTemplate {
     ///
     /// # Errors
     ///
-    /// - Nested repeat string
-    /// - repeat string in position 0
-    /// - repeat string in another position
-    /// - repeat string used in an object or at the top-level rather than as an array item
+    /// - [`TemplateParsingError`]: refer to the documentation of this type
     pub fn new(
         template: Value,
         placeholder_string: String,
@@ -188,74 +395,83 @@ impl ValueTemplate {
             &mut Some(&mut array_path),
             &mut current_path,
         )?;
-        Ok(Self { template, value_path, array_path })
-    }
 
-    /// Whether there is a placeholder that is not repeated.
-    ///
-    /// - During injection and extraction the static value must be populated if present.
-    pub fn has_static_value(&self) -> bool {
-        self.value_path.is_some()
+        let value_kind = match (array_path, value_path) {
+            (None, None) => return Err(TemplateParsingError::MissingPlaceholderString),
+            (None, Some(value_path)) => ValueKind::Single(value_path),
+            (Some(array_path), None) => ValueKind::Array(array_path),
+            (Some(array_path), Some(value_path)) => {
+                return Err(TemplateParsingError::BothArrayAndSingle {
+                    single_path: value_path,
+                    path_to_array: array_path.path_to_array,
+                    array_to_placeholder: array_path.value_path_in_array,
+                })
+            }
+        };
+
+        Ok(Self { template, value_kind })
     }
 
     /// Whether there is a placeholder that can be repeated.
     ///
-    /// - During injection, any excess values after injecting the static placeholder are injected in the array placeholder,
+    /// - During injection, all values are injected in the array placeholder,
     /// - During extraction, all repeatable placeholders are extracted from the array.
     pub fn has_array_value(&self) -> bool {
-        self.array_path.is_some()
+        matches!(self.value_kind, ValueKind::Array(_))
     }
 
     /// Render a value from the template and context values.
     ///
     /// # Error
     ///
-    /// - [`MissingStaticValue`]: if the number of injected values is 0 and there is a static placeholder.
-    pub fn inject(
-        &self,
-        values: impl IntoIterator<Item = Value>,
-    ) -> Result<Value, MissingStaticValue> {
+    /// - [`MissingValue`]: if the number of injected values is 0.
+    pub fn inject(&self, values: impl IntoIterator<Item = Value>) -> Result<Value, MissingValue> {
         let mut rendered = self.template.clone();
         let mut values = values.into_iter();
 
-        if let Some(injection_path) = &self.value_path {
-            let Some(injected_value) = values.next() else { return Err(MissingStaticValue) };
-            let mut current_value = &mut rendered;
-            for injection_component in injection_path {
-                current_value = match injection_component {
-                    PathComponent::MapKey(key) => current_value.get_mut(key).unwrap(),
-                    PathComponent::ArrayIndex(index) => current_value.get_mut(index).unwrap(),
-                }
-            }
-            *current_value = injected_value;
-        }
-
-        if let Some(ArrayPath { repeated_value, path_to_array, value_path_in_array }) =
-            &self.array_path
-        {
-            // 1. build the array or repeated values
-            let mut array = Vec::new();
-            for injected_value in values {
-                let mut repeated_value = repeated_value.clone();
-                let mut current_value = &mut repeated_value;
-                for injection_component in value_path_in_array {
+        match &self.value_kind {
+            ValueKind::Single(injection_path) => {
+                let Some(injected_value) = values.next() else { return Err(MissingValue) };
+                let mut current_value = &mut rendered;
+                for injection_component in injection_path {
                     current_value = match injection_component {
                         PathComponent::MapKey(key) => current_value.get_mut(key).unwrap(),
                         PathComponent::ArrayIndex(index) => current_value.get_mut(index).unwrap(),
                     }
                 }
                 *current_value = injected_value;
-                array.push(repeated_value);
             }
-            // 2. inject at the injection point in the rendered value
-            let mut current_value = &mut rendered;
-            for injection_component in path_to_array {
-                current_value = match injection_component {
-                    PathComponent::MapKey(key) => current_value.get_mut(key).unwrap(),
-                    PathComponent::ArrayIndex(index) => current_value.get_mut(index).unwrap(),
+            ValueKind::Array(ArrayPath { repeated_value, path_to_array, value_path_in_array }) => {
+                // 1. build the array or repeated values
+                let mut array = Vec::new();
+                for injected_value in values {
+                    let mut repeated_value = repeated_value.clone();
+                    let mut current_value = &mut repeated_value;
+                    for injection_component in value_path_in_array {
+                        current_value = match injection_component {
+                            PathComponent::MapKey(key) => current_value.get_mut(key).unwrap(),
+                            PathComponent::ArrayIndex(index) => {
+                                current_value.get_mut(index).unwrap()
+                            }
+                        }
+                    }
+                    *current_value = injected_value;
+                    array.push(repeated_value);
                 }
+
+                if array.is_empty() {
+                    return Err(MissingValue);
+                }
+                // 2. inject at the injection point in the rendered value
+                let mut current_value = &mut rendered;
+                for injection_component in path_to_array {
+                    current_value = match injection_component {
+                        PathComponent::MapKey(key) => current_value.get_mut(key).unwrap(),
+                        PathComponent::ArrayIndex(index) => current_value.get_mut(index).unwrap(),
+                    }
+                }
+                *current_value = Value::Array(array);
             }
-            *current_value = Value::Array(array);
         }
 
         Ok(rendered)
@@ -265,74 +481,73 @@ impl ValueTemplate {
     ///
     /// # Errors
     ///
-    /// - if a static placeholder is missing.
+    /// - if a single placeholder is missing.
     /// - if there is no value corresponding to an array placeholder
     /// - if the value corresponding to an array placeholder is not an array
-    pub fn extract(&self, mut value: Value) -> Result<ExtractedValues, ExtractionError> {
-        let mut static_value = None;
-
-        for extraction_path in self.value_path.iter() {
-            let extracted_value =
-                extract_value(extraction_path, &mut value).with_context(|kind| {
-                    ExtractionError {
-                        kind,
-                        context: ExtractionErrorContext::ExtractingStaticValue,
-                        template: self.template.clone(),
-                        value: value.clone(),
-                    }
-                })?;
-            static_value = Some(extracted_value);
-        }
-
-        let mut array_values = None;
-
-        if let Some(ArrayPath { repeated_value: _, path_to_array, value_path_in_array }) =
-            &self.array_path
-        {
-            // get the array
-            let array =
-                extract_value(path_to_array, &mut value).with_context(|kind| ExtractionError {
-                    kind,
-                    context: ExtractionErrorContext::FindingPathToArray,
-                    template: self.template.clone(),
-                    value: value.clone(),
-                })?;
-            let array = match array {
-                Value::Array(array) => array,
-                not_array => {
-                    let mut path = path_to_array.clone();
-                    path.push(PathComponent::ArrayIndex(0));
-                    return Err(ExtractionError {
-                        kind: ExtractionErrorKind::WrongPathComponent {
-                            wrong_component: format_value(&not_array),
-                            index: path_to_array.len(),
-                            path,
-                        },
-                        context: ExtractionErrorContext::FindingPathToArray,
-                        template: self.template.clone(),
-                        value: value.clone(),
-                    });
-                }
-            };
-            let mut extracted_values = Vec::with_capacity(array.len());
-
-            for mut item in array {
+    pub fn extract<T>(&self, mut value: Value) -> Result<Vec<T>, ExtractionError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        Ok(match &self.value_kind {
+            ValueKind::Single(extraction_path) => {
                 let extracted_value =
-                    extract_value(value_path_in_array, &mut item).with_context(|kind| {
+                    extract_value(extraction_path, &mut value).with_context(|kind| {
                         ExtractionError {
                             kind,
-                            context: ExtractionErrorContext::ExtractingArrayItem,
+                            context: ExtractionErrorContext::ExtractingSingleValue,
                             template: self.template.clone(),
                             value: value.clone(),
                         }
                     })?;
-                extracted_values.push(extracted_value);
+                vec![extracted_value]
             }
+            ValueKind::Array(ArrayPath {
+                repeated_value: _,
+                path_to_array,
+                value_path_in_array,
+            }) => {
+                // get the array
+                let array = extract_value(path_to_array, &mut value).with_context(|kind| {
+                    ExtractionError {
+                        kind,
+                        context: ExtractionErrorContext::FindingPathToArray,
+                        template: self.template.clone(),
+                        value: value.clone(),
+                    }
+                })?;
+                let array = match array {
+                    Value::Array(array) => array,
+                    not_array => {
+                        let mut path = path_to_array.clone();
+                        path.push(PathComponent::ArrayIndex(0));
+                        return Err(ExtractionError {
+                            kind: ExtractionErrorKind::WrongPathComponent {
+                                wrong_component: format_value(&not_array),
+                                index: path_to_array.len(),
+                                path,
+                            },
+                            context: ExtractionErrorContext::FindingPathToArray,
+                            template: self.template.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                };
+                let mut extracted_values = Vec::with_capacity(array.len());
 
-            array_values = Some(extracted_values);
-        }
+                for (index, mut item) in array.into_iter().enumerate() {
+                    let extracted_value = extract_value(value_path_in_array, &mut item)
+                        .with_context(|kind| ExtractionError {
+                            kind,
+                            context: ExtractionErrorContext::ExtractingArrayItem(index),
+                            template: self.template.clone(),
+                            value: value.clone(),
+                        })?;
+                    extracted_values.push(extracted_value);
+                }
 
-        Ok(ExtractedValues { static_value, array_values })
+                extracted_values
+            }
+        })
     }
 
     fn parse_array(
@@ -491,18 +706,21 @@ impl ValueTemplate {
 
 fn format_value(value: &Value) -> String {
     match value {
-        Value::Array(array) => format!("array of size {}", array.len()),
+        Value::Array(array) => format!("an array of size {}", array.len()),
         Value::Object(object) => {
-            format!("object with {} fields", object.len())
+            format!("an object with {} fields", object.len())
         }
         value => value.to_string(),
     }
 }
 
-fn extract_value(
+fn extract_value<T>(
     extraction_path: &[PathComponent],
     initial_value: &mut Value,
-) -> Result<Value, ExtractionErrorKind> {
+) -> Result<T, ExtractionErrorKind>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let mut current_value = initial_value;
     for (path_index, extraction_component) in extraction_path.iter().enumerate() {
         current_value = {
@@ -528,13 +746,7 @@ fn extract_value(
                 PathComponent::ArrayIndex(index) => {
                     if !current_value.is_array() {
                         return Err(ExtractionErrorKind::WrongPathComponent {
-                            wrong_component: match current_value {
-                                Value::Array(array) => format!("array of size {}", array.len()),
-                                Value::Object(object) => {
-                                    format!("object with {} fields", object.len())
-                                }
-                                current_value => current_value.to_string(),
-                            },
+                            wrong_component: format_value(current_value),
                             index: path_index,
                             path: extraction_path.to_vec(),
                         });
@@ -552,8 +764,9 @@ fn extract_value(
             }
         };
     }
-    let extracted_value = current_value.take();
-    Ok(extracted_value)
+    serde_json::from_value(current_value.take()).map_err(|error| {
+        ExtractionErrorKind::DeserializationError { error, path: extraction_path.to_vec() }
+    })
 }
 
 trait ExtractionResultErrorContext<T> {
@@ -588,21 +801,16 @@ mod test {
     fn empty_template() {
         let template = json!({
             "toto": "no template at all",
-            "titi": ["this", "will", "still", "work"],
+            "titi": ["this", "will", "not", "work"],
             "tutu": null
         });
 
-        let empty = new_template(template.clone()).unwrap();
-
-        assert!(!empty.has_static_value());
-        assert!(!empty.has_array_value());
-
-        assert_eq!(empty.inject(vec![]).unwrap(), template);
-        assert_eq!(empty.inject(vec!["test".into()]).unwrap(), template);
+        let error = new_template(template.clone()).unwrap_err();
+        assert!(matches!(error, TemplateParsingError::MissingPlaceholderString))
     }
 
     #[test]
-    fn static_template() {
+    fn single_template() {
         let template = json!({
             "toto": "text",
             "titi": ["this", "will", "still", "{{text}}"],
@@ -611,7 +819,6 @@ mod test {
 
         let basic = new_template(template.clone()).unwrap();
 
-        assert!(basic.has_static_value());
         assert!(!basic.has_array_value());
 
         assert_eq!(
@@ -660,7 +867,6 @@ mod test {
 
         let basic = new_template(template.clone()).unwrap();
 
-        assert!(!basic.has_static_value());
         assert!(basic.has_array_value());
 
         let injected_values = vec![
@@ -713,10 +919,7 @@ mod test {
             })
         );
 
-        let extracted_values = basic.extract(rendered).unwrap();
-        match extracted_values.array_values {
-            Some(array_values) => assert_eq!(array_values, injected_values),
-            None => panic!("no array values"),
-        }
+        let extracted_values: Vec<Value> = basic.extract(rendered).unwrap();
+        assert_eq!(extracted_values, injected_values);
     }
 }
