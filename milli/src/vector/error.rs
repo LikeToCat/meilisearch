@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use hf_hub::api::sync::ApiError;
 
 use super::parsed_vectors::ParsedVectorsDiff;
+use super::rest::ConfigurationSource;
 use crate::error::FaultSource;
 use crate::{FieldDistribution, PanicCatched};
 
@@ -45,42 +46,55 @@ pub struct EmbedError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedErrorKind {
-    #[error("could not tokenize: {0}")]
+    #[error("could not tokenize:\n  - {0}")]
     Tokenize(Box<dyn std::error::Error + Send + Sync>),
-    #[error("unexpected tensor shape: {0}")]
+    #[error("unexpected tensor shape:\n  - {0}")]
     TensorShape(candle_core::Error),
-    #[error("unexpected tensor value: {0}")]
+    #[error("unexpected tensor value:\n  - {0}")]
     TensorValue(candle_core::Error),
-    #[error("could not run model: {0}")]
+    #[error("could not run model:\n  - {0}")]
     ModelForward(candle_core::Error),
-    #[error("attempt to embed the following text in a configuration where embeddings must be user provided: {0:?}")]
+    #[error("attempt to embed the following text in a configuration where embeddings must be user provided:\n  - `{0}`")]
     ManualEmbed(String),
-    #[error("model not found. Meilisearch will not automatically download models from the Ollama library, please pull the model manually: {0:?}")]
+    #[error("model not found. Meilisearch will not automatically download models from the Ollama library, please pull the model manually{}", option_info(.0.as_deref(), "server replied with "))]
     OllamaModelNotFoundError(Option<String>),
-    #[error("error deserialization the response body as JSON: {0}")]
+    #[error("error deserialization the response body as JSON:\n  - {0}")]
     RestResponseDeserialization(std::io::Error),
     #[error("expected a response containing {0} embeddings, got only {1}")]
     RestResponseEmbeddingCount(usize, usize),
-    #[error("could not authenticate against embedding server: {0:?}")]
+    #[error("could not authenticate against embedding server{}", option_info(.0.as_deref(), "server replied with "))]
     RestUnauthorized(Option<String>),
-    #[error("sent too many requests to embedding server: {0:?}")]
+    #[error("sent too many requests to embedding server{}", option_info(.0.as_deref(), "server replied with "))]
     RestTooManyRequests(Option<String>),
-    #[error("sent a bad request to embedding server: {0:?}")]
-    RestBadRequest(Option<String>),
-    #[error("received internal error from embedding server: {0:?}")]
+    #[error("sent a bad request to embedding server{}{}",
+    if ConfigurationSource::User == *.1 {
+        "\n  - Hint: check that the `request` in the embedder configuration matches the remote server's API"
+    } else {
+        ""
+    },
+    option_info(.0.as_deref(), "server replied with "))]
+    RestBadRequest(Option<String>, ConfigurationSource),
+    #[error("received internal error HTTP {0} from embedding server{}", option_info(.1.as_deref(), "server replied with "))]
     RestInternalServerError(u16, Option<String>),
-    #[error("received HTTP {0} from embedding server: {0:?}")]
+    #[error("received unexpected HTTP {0} from embedding server{}", option_info(.1.as_deref(), "server replied with "))]
     RestOtherStatusCode(u16, Option<String>),
-    #[error("could not reach embedding server: {0}")]
+    #[error("could not reach embedding server:\n  - {0}")]
     RestNetwork(ureq::Transport),
-    #[error("error extracting embeddings from the response: {0}")]
+    #[error("error extracting embeddings from the response:\n  - {0}")]
     RestExtractionError(String),
-    #[error("while embedding tokenized, was expecting embeddings of dimension `{0}`, got embeddings of dimensions `{1}`")]
+    #[error("was expecting embeddings of dimension `{0}`, got embeddings of dimensions `{1}`")]
     UnexpectedDimension(usize, usize),
     #[error("no embedding was produced")]
     MissingEmbedding,
     #[error(transparent)]
     PanicInThreadPool(#[from] PanicCatched),
+}
+
+fn option_info(info: Option<&str>, prefix: &str) -> String {
+    match info {
+        Some(info) => format!("\n  - {prefix}`{info}`"),
+        None => String::new(),
+    }
 }
 
 impl EmbedError {
@@ -133,8 +147,14 @@ impl EmbedError {
         }
     }
 
-    pub(crate) fn rest_bad_request(error_response: Option<String>) -> EmbedError {
-        Self { kind: EmbedErrorKind::RestBadRequest(error_response), fault: FaultSource::User }
+    pub(crate) fn rest_bad_request(
+        error_response: Option<String>,
+        configuration_source: ConfigurationSource,
+    ) -> EmbedError {
+        Self {
+            kind: EmbedErrorKind::RestBadRequest(error_response, configuration_source),
+            fault: FaultSource::User,
+        }
     }
 
     pub(crate) fn rest_internal_server_error(
@@ -246,7 +266,7 @@ impl NewEmbedderError {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("could not open config at {filename:?}: {inner}")]
+#[error("could not open config at {filename}: {inner}")]
 pub struct OpenConfig {
     pub filename: PathBuf,
     pub inner: std::io::Error,
@@ -277,17 +297,17 @@ pub enum NewEmbedderErrorKind {
     DeserializeConfig(DeserializeConfig),
     #[error(transparent)]
     OpenTokenizer(OpenTokenizer),
-    #[error("could not build weights from Pytorch weights: {0}")]
+    #[error("could not build weights from Pytorch weights:\n  - {0}")]
     PytorchWeight(candle_core::Error),
-    #[error("could not build weights from Safetensor weights: {0}")]
+    #[error("could not build weights from Safetensor weights:\n  - {0}")]
     SafetensorWeight(candle_core::Error),
-    #[error("could not spawn HG_HUB API client: {0}")]
+    #[error("could not spawn HG_HUB API client:\n  - {0}")]
     NewApiFail(ApiError),
-    #[error("fetching file from HG_HUB failed: {0}")]
+    #[error("fetching file from HG_HUB failed:\n  - {0}")]
     ApiGet(ApiError),
-    #[error("could not determine model dimensions: test embedding failed with {0}")]
+    #[error("could not determine model dimensions:\n  - test embedding failed with {0}")]
     CouldNotDetermineDimension(EmbedError),
-    #[error("loading model failed: {0}")]
+    #[error("loading model failed:\n  - {0}")]
     LoadModel(candle_core::Error),
     #[error("{0}")]
     CouldNotParseTemplate(String),
