@@ -28,19 +28,22 @@ impl EmbedderOptions {
 impl Embedder {
     pub fn new(options: EmbedderOptions) -> Result<Self, NewEmbedderError> {
         let model = options.embedding_model.as_str();
-        let rest_embedder = match RestEmbedder::new(RestEmbedderOptions {
-            api_key: options.api_key,
-            dimensions: None,
-            distribution: options.distribution,
-            url: options.url.unwrap_or_else(get_ollama_path),
-            request: serde_json::json!({
-                "model": model,
-                "prompt": "{{text}}",
-            }),
-            response: serde_json::json!({
-                "embedding": "{{embedding}}",
-            }),
-        }) {
+        let rest_embedder = match RestEmbedder::new(
+            RestEmbedderOptions {
+                api_key: options.api_key,
+                dimensions: None,
+                distribution: options.distribution,
+                url: options.url.unwrap_or_else(get_ollama_path),
+                request: serde_json::json!({
+                    "model": model,
+                    "prompt": "{{text}}",
+                }),
+                response: serde_json::json!({
+                    "embedding": "{{embedding}}",
+                }),
+            },
+            super::rest::ConfigurationSource::Ollama,
+        ) {
             Ok(embedder) => embedder,
             Err(NewEmbedderError {
                 kind:

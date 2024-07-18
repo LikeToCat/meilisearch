@@ -17,6 +17,13 @@ pub struct Retry {
     strategy: RetryStrategy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigurationSource {
+    OpenAi,
+    Ollama,
+    User,
+}
+
 pub enum RetryStrategy {
     GiveUp,
     Retry,
@@ -76,6 +83,7 @@ struct EmbedderData {
     url: String,
     request: Request,
     response: Response,
+    configuration_source: ConfigurationSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -109,7 +117,10 @@ enum InputType {
 }
 
 impl Embedder {
-    pub fn new(options: EmbedderOptions) -> Result<Self, NewEmbedderError> {
+    pub fn new(
+        options: EmbedderOptions,
+        configuration_source: ConfigurationSource,
+    ) -> Result<Self, NewEmbedderError> {
         let bearer = options.api_key.as_deref().map(|api_key| format!("Bearer {api_key}"));
 
         let client = ureq::AgentBuilder::new()
@@ -120,7 +131,14 @@ impl Embedder {
         let request = Request::new(options.request)?;
         let response = Response::new(options.response, &request)?;
 
-        let data = EmbedderData { client, bearer, url: options.url, request, response };
+        let data = EmbedderData {
+            client,
+            bearer,
+            url: options.url,
+            request,
+            response,
+            configuration_source,
+        };
 
         let dimensions = if let Some(dimensions) = options.dimensions {
             dimensions
@@ -211,7 +229,7 @@ where
 
     for attempt in 0..10 {
         let response = request.clone().send_json(&body);
-        let result = check_response(response);
+        let result = check_response(response, data.configuration_source);
 
         let retry_duration = match result {
             Ok(response) => {
@@ -234,13 +252,16 @@ where
     }
 
     let response = request.send_json(&body);
-    let result = check_response(response);
+    let result = check_response(response, data.configuration_source);
     result.map_err(Retry::into_error).and_then(|response| {
         response_to_embedding(response, data, expected_count, expected_dimension)
     })
 }
 
-fn check_response(response: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, Retry> {
+fn check_response(
+    response: Result<ureq::Response, ureq::Error>,
+    configuration_source: ConfigurationSource,
+) -> Result<ureq::Response, Retry> {
     match response {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(code, response)) => {
@@ -248,7 +269,10 @@ fn check_response(response: Result<ureq::Response, ureq::Error>) -> Result<ureq:
             Err(match code {
                 401 => Retry::give_up(EmbedError::rest_unauthorized(error_response)),
                 429 => Retry::rate_limited(EmbedError::rest_too_many_requests(error_response)),
-                400 => Retry::give_up(EmbedError::rest_bad_request(error_response)),
+                400 => Retry::give_up(EmbedError::rest_bad_request(
+                    error_response,
+                    configuration_source,
+                )),
                 500..=599 => {
                     Retry::retry_later(EmbedError::rest_internal_server_error(code, error_response))
                 }

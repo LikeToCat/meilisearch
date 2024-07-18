@@ -181,20 +181,23 @@ impl Embedder {
 
         let url = options.url.as_deref().unwrap_or(OPENAI_EMBEDDINGS_URL).to_owned();
 
-        let rest_embedder = RestEmbedder::new(RestEmbedderOptions {
-            api_key: Some(api_key.clone()),
-            distribution: None,
-            dimensions: Some(options.dimensions()),
-            url,
-            request: options.request(),
-            response: serde_json::json!({
-                "data": [{
-                    "embedding": "{{embedding}}"
-                },
-                "{{..}}"
-                ]
-            }),
-        })?;
+        let rest_embedder = RestEmbedder::new(
+            RestEmbedderOptions {
+                api_key: Some(api_key.clone()),
+                distribution: None,
+                dimensions: Some(options.dimensions()),
+                url,
+                request: options.request(),
+                response: serde_json::json!({
+                    "data": [{
+                        "embedding": "{{embedding}}"
+                    },
+                    "{{..}}"
+                    ]
+                }),
+            },
+            super::rest::ConfigurationSource::OpenAi,
+        )?;
 
         // looking at the code it is very unclear that this can actually fail.
         let tokenizer = tiktoken_rs::cl100k_base().unwrap();
@@ -205,7 +208,7 @@ impl Embedder {
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Embeddings<f32>>, EmbedError> {
         match self.rest_embedder.embed_ref(&texts) {
             Ok(embeddings) => Ok(embeddings),
-            Err(EmbedError { kind: EmbedErrorKind::RestBadRequest(error), fault: _ }) => {
+            Err(EmbedError { kind: EmbedErrorKind::RestBadRequest(error, _), fault: _ }) => {
                 tracing::warn!(error=?error, "OpenAI: received `BAD_REQUEST`. Input was maybe too long, retrying on tokenized version. For best performance, limit the size of your document template.");
                 self.try_embed_tokenized(&texts)
             }
