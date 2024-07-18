@@ -108,29 +108,29 @@ impl TemplateParsingError {
         match self {
             TemplateParsingError::NestedRepeatString(path) => {
                 format!(
-                    r#"""in {}: "{repeat}" appears nested inside of a value that is itself repeated"""#,
+                    r#"in {}: "{repeat}" appears nested inside of a value that is itself repeated"#,
                     path_with_root(root, path)
                 )
             }
             TemplateParsingError::RepeatStringNotInArray(path) => format!(
-                r#"""in {}: "{repeat}" appears outside of an array"""#,
+                r#"in {}: "{repeat}" appears outside of an array"#,
                 path_with_root(root, path)
             ),
             TemplateParsingError::BadIndexForRepeatString(path, index) => format!(
-                r#"""in {}: "{repeat}" expected at position #1, but found at position #{index}"""#,
+                r#"in {}: "{repeat}" expected at position #1, but found at position #{index}"#,
                 path_with_root(root, path)
             ),
             TemplateParsingError::MissingPlaceholderInRepeatedValue(path) => format!(
-                r#"""in {}: Expected "{placeholder}" inside of the repeated value"""#,
+                r#"in {}: Expected "{placeholder}" inside of the repeated value"#,
                 path_with_root(root, path)
             ),
             TemplateParsingError::MultipleRepeatString(current, previous) => format!(
-                r#"""in {}: Found "{repeat}", but it was already present in {}"""#,
+                r#"in {}: Found "{repeat}", but it was already present in {}"#,
                 path_with_root(root, current),
                 path_with_root(root, previous)
             ),
             TemplateParsingError::MultiplePlaceholderString(current, previous) => format!(
-                r#"""in {}: Found "{placeholder}", but it was already present in {}"""#,
+                r#"in {}: Found "{placeholder}", but it was already present in {}"#,
                 path_with_root(root, current),
                 path_with_root(root, previous)
             ),
@@ -151,6 +151,61 @@ impl TemplateParsingError {
                     path_with_root(root, single_path),
                     path_with_root(root, path_to_first_repeated)
                 )
+            }
+        }
+    }
+
+    fn prepend_path(self, mut prepended_path: ValuePath) -> Self {
+        match self {
+            TemplateParsingError::NestedRepeatString(mut path) => {
+                prepended_path.append(&mut path);
+                TemplateParsingError::NestedRepeatString(prepended_path)
+            }
+            TemplateParsingError::RepeatStringNotInArray(mut path) => {
+                prepended_path.append(&mut path);
+                TemplateParsingError::RepeatStringNotInArray(prepended_path)
+            }
+            TemplateParsingError::BadIndexForRepeatString(mut path, index) => {
+                prepended_path.append(&mut path);
+                TemplateParsingError::BadIndexForRepeatString(prepended_path, index)
+            }
+            TemplateParsingError::MissingPlaceholderInRepeatedValue(mut path) => {
+                prepended_path.append(&mut path);
+                TemplateParsingError::MissingPlaceholderInRepeatedValue(prepended_path)
+            }
+            TemplateParsingError::MultipleRepeatString(mut path, older_path) => {
+                let older_prepended_path =
+                    prepended_path.iter().cloned().chain(older_path).collect();
+                prepended_path.append(&mut path);
+                TemplateParsingError::MultipleRepeatString(prepended_path, older_prepended_path)
+            }
+            TemplateParsingError::MultiplePlaceholderString(mut path, older_path) => {
+                let older_prepended_path =
+                    prepended_path.iter().cloned().chain(older_path).collect();
+                prepended_path.append(&mut path);
+                TemplateParsingError::MultiplePlaceholderString(
+                    prepended_path,
+                    older_prepended_path,
+                )
+            }
+            TemplateParsingError::MissingPlaceholderString => {
+                TemplateParsingError::MissingPlaceholderString
+            }
+            TemplateParsingError::BothArrayAndSingle {
+                single_path,
+                mut path_to_array,
+                array_to_placeholder,
+            } => {
+                // note, this case is not super logical, but is also likely to be dead code
+                let single_prepended_path =
+                    prepended_path.iter().cloned().chain(single_path).collect();
+                prepended_path.append(&mut path_to_array);
+                // we don't prepend the array_to_placeholder path as it is the array path that is prepended
+                TemplateParsingError::BothArrayAndSingle {
+                    single_path: single_prepended_path,
+                    path_to_array: prepended_path,
+                    array_to_placeholder,
+                }
             }
         }
     }
@@ -191,18 +246,23 @@ impl ExtractionError {
             }
         };
         match &self.kind {
-            ExtractionErrorKind::MissingPathComponent { missing_index, path } => {
+            ExtractionErrorKind::MissingPathComponent { missing_index, path, key_suggestion } => {
                 let last_named_object = last_named_object(root, path.iter().take(*missing_index));
                 format!(
-                    "in {}, while {context}, missing {}",
+                    "in {}, while {context}, configuration expects {}, which is missing in response{}",
                     path_with_root(root, path.iter().take(*missing_index)),
-                    missing_component(path.get(*missing_index), last_named_object)
+                    missing_component(path.get(*missing_index)),
+                    match key_suggestion {
+                        Some(key_suggestion) => format!("\n  - Hint: {last_named_object} has key `{key_suggestion}`, did you mean {} in embedder configuration?",
+                        path_with_root(root, path.iter().take(*missing_index).chain(std::iter::once(&PathComponent::MapKey(key_suggestion.to_owned()))))),
+                        None => "".to_owned(),
+                    }
                 )
             }
             ExtractionErrorKind::WrongPathComponent { wrong_component, index, path } => {
                 let last_named_object = last_named_object(root, path.iter().take(*index));
                 format!(
-                    "in {}, while {context}, expected {last_named_object} to be {} but it is {wrong_component}",
+                    "in {}, while {context}, configuration expects {last_named_object} to be {} but server sent {wrong_component}",
                     path_with_root(root, path.iter().take(*index)),
                     expected_component(path.get(*index))
                 )
@@ -210,7 +270,7 @@ impl ExtractionError {
             ExtractionErrorKind::DeserializationError { error, path } => {
                 let last_named_object = last_named_object(root, path);
                 format!(
-                    "in {}, while {context}, expected {last_named_object} to be {expected_value_type}, but failed to parse it with {error}",
+                    "in {}, while {context}, expected {last_named_object} to be {expected_value_type}, but failed to parse server response:\n  - {error}",
                     path_with_root(root, path)
                 )
             }
@@ -218,16 +278,13 @@ impl ExtractionError {
     }
 }
 
-fn missing_component(
-    component: Option<&PathComponent>,
-    named_object: LastNamedObject<'_>,
-) -> String {
+fn missing_component(component: Option<&PathComponent>) -> String {
     match component {
         Some(PathComponent::ArrayIndex(index)) => {
-            format!(r#"item #{index} ({named_object} has less than {index} elements)"#)
+            format!(r#"item #{index}"#)
         }
         Some(PathComponent::MapKey(key)) => {
-            format!(r#"key "{key} ({named_object} doesn't have this key)""#)
+            format!(r#"key "{key}""#)
         }
         None => "unknown".to_string(),
     }
@@ -236,7 +293,7 @@ fn missing_component(
 fn expected_component(component: Option<&PathComponent>) -> String {
     match component {
         Some(PathComponent::ArrayIndex(index)) => {
-            format!(r#"an array with at least {} items"#, index.saturating_add(1))
+            format!(r#"an array with at least {} item(s)"#, index.saturating_add(1))
         }
         Some(PathComponent::MapKey(key)) => {
             format!("an object with key `{}`", key)
@@ -345,6 +402,8 @@ pub enum ExtractionErrorKind {
         missing_index: usize,
         /// Path where a component is missing
         path: ValuePath,
+        /// Possible matching key in object
+        key_suggestion: Option<String>,
     },
     /// An expected path component cannot be found because its container is the wrong type
     WrongPathComponent {
@@ -587,7 +646,7 @@ impl ValueTemplate {
 
                 let value_path_in_array = {
                     let mut value_path = None;
-                    let mut current_path = Vec::new();
+                    let mut current_path_in_array = Vec::new();
 
                     Self::parse_value(
                         first,
@@ -595,13 +654,14 @@ impl ValueTemplate {
                         repeat_string,
                         &mut value_path,
                         &mut None,
-                        &mut current_path,
-                    )?;
+                        &mut current_path_in_array,
+                    )
+                    .map_err(|error| error.prepend_path(current_path.to_vec()))?;
 
                     value_path.ok_or_else(|| {
-                        TemplateParsingError::MissingPlaceholderInRepeatedValue(
-                            current_path.clone(),
-                        )
+                        let mut repeated_value_path = current_path.clone();
+                        repeated_value_path.push(PathComponent::ArrayIndex(0));
+                        TemplateParsingError::MissingPlaceholderInRepeatedValue(repeated_value_path)
                     })?
                 };
                 **array_path = Some(ArrayPath {
@@ -708,7 +768,7 @@ fn format_value(value: &Value) -> String {
     match value {
         Value::Array(array) => format!("an array of size {}", array.len()),
         Value::Object(object) => {
-            format!("an object with {} fields", object.len())
+            format!("an object with {} field(s)", object.len())
         }
         value => value.to_string(),
     }
@@ -733,14 +793,41 @@ where
                             path: extraction_path.to_vec(),
                         });
                     }
-                    match current_value.get_mut(key) {
-                        Some(value) => value,
-                        None => {
+                    if let Some(object) = current_value.as_object_mut() {
+                        if !object.contains_key(key) {
+                            let typos =
+                                levenshtein_automata::LevenshteinAutomatonBuilder::new(2, true)
+                                    .build_dfa(key);
+                            let mut key_suggestion = None;
+                            'check_typos: for (key, _) in object.iter() {
+                                match typos.eval(key) {
+                                    levenshtein_automata::Distance::Exact(0) => { /* ??? */ }
+                                    levenshtein_automata::Distance::Exact(_) => {
+                                        key_suggestion = Some(key.to_owned());
+                                        break 'check_typos;
+                                    }
+                                    levenshtein_automata::Distance::AtLeast(_) => continue,
+                                }
+                            }
                             return Err(ExtractionErrorKind::MissingPathComponent {
                                 missing_index: path_index,
                                 path: extraction_path.to_vec(),
+                                key_suggestion,
                             });
                         }
+                        if let Some(value) = object.get_mut(key) {
+                            value
+                        } else {
+                            // borrow checking limit: the borrow checker cannot be convinced that `object` is no longer mutably borrowed on the
+                            // `else` branch of the `if let`, so we cannot return MissingPathComponent here.
+                            // As a workaround, we checked that the object does not contain the key above, making this `else` unreachable.
+                            unreachable!()
+                        }
+                    } else {
+                        // borrow checking limit: the borrow checker cannot be convinced that `current_value` is no longer mutably borrowed
+                        // on the `else` branch of the `if let`, so we cannot return WrongPathComponent here.
+                        // As a workaround, we checked that the value was not a map above, making this `else` unreachable.
+                        unreachable!()
                     }
                 }
                 PathComponent::ArrayIndex(index) => {
@@ -757,6 +844,7 @@ where
                             return Err(ExtractionErrorKind::MissingPathComponent {
                                 missing_index: path_index,
                                 path: extraction_path.to_vec(),
+                                key_suggestion: None,
                             });
                         }
                     }
