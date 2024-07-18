@@ -370,7 +370,7 @@ impl Response {
 
         match (template.has_array_value(), request.template.has_array_value()) {
             (true, true) | (false, false) => Ok(Self {template}),
-            (true, false) => Err(NewEmbedderError::rest_could_not_parse_template("in `response`: `response` has multiple embeddings, but `request` only has one text to embed".to_string())),
+            (true, false) => Err(NewEmbedderError::rest_could_not_parse_template("in `response`: `response` has multiple embeddings, but `request` has only one text to embed".to_string())),
             (false, true) => Err(NewEmbedderError::rest_could_not_parse_template("in `response`: `response` has a single embedding, but `request` has multiple texts to embed".to_string())),
         }
     }
